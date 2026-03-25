@@ -1,7 +1,7 @@
 {
   "name": "@slopus/sprint",
-  "version": "2.0.0",
-  "description": "Harness-driven sprint planner & executor for pi — visible in-session planning, execution, and review",
+  "version": "2.1.0",
+  "description": "Debate-based sprint planner & executor for pi — subagent planning, live stats widget, format validation",
   "keywords": ["pi-package"],
   "license": "MIT",
   "repository": {
