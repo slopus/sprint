@@ -1,0 +1,17 @@
+{
+  "name": "@slopus/sprint",
+  "version": "1.0.0",
+  "description": "Debate-based sprint planner & executor for pi — multi-model planning, task execution, review, and reporting",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slopus/sprint"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
