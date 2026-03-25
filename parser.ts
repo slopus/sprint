@@ -3,6 +3,14 @@
  * Classifies each task as frontend or backend for model routing.
  */
 
+export interface TokenUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
 export interface TaskEvent {
 	timestamp: number;
 	type: "started" | "executed" | "review_pass" | "review_needs_work" | "retried" | "user_override" | "skipped" | "stopped";
@@ -24,6 +32,10 @@ export interface SprintTask {
 	startedAt: number | null;
 	completedAt: number | null;
 	events: TaskEvent[];
+	/** Accumulated token usage across all subagent calls for this task */
+	usage: TokenUsage;
+	/** Total wall-clock time for execution + review (ms) */
+	executionDurationMs: number;
 }
 
 const FRONTEND_PATH_PATTERNS = [
@@ -128,6 +140,8 @@ export function parseTasks(synthesis: string): SprintTask[] {
 			startedAt: null,
 			completedAt: null,
 			events: [],
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
+			executionDurationMs: 0,
 		});
 	}
 

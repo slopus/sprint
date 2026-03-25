@@ -3,15 +3,17 @@
  * then orchestrates a post-task review debate.
  *
  * Model routing:
- *   Frontend tasks → anthropic/claude-opus-4-6 (thinking)
- *   Backend tasks  → openai-codex/gpt-5.4       (xhigh)
+ *   Frontend tasks → anthropic/claude-opus-4-6 (no thinking)
+ *   Backend tasks  → openai-codex/gpt-5.4       (high)
+ *
+ * Tracks token usage and cost from JSON mode events.
  */
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SprintTask } from "./parser.js";
+import type { SprintTask, TokenUsage } from "./parser.js";
 
 // ---------------------------------------------------------------------------
 // Model configuration
@@ -49,6 +51,12 @@ export interface SubagentResult {
 	output: string;
 	exitCode: number;
 	model?: string;
+	durationMs: number;
+	usage: TokenUsage;
+}
+
+function emptyUsage(): TokenUsage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -82,6 +90,8 @@ export async function runPiSubagent(opts: {
 
 	let output = "";
 	let model: string | undefined;
+	const usage = emptyUsage();
+	const startTime = Date.now();
 
 	const exitCode = await new Promise<number>((resolve) => {
 		const invocation = getPiInvocation(args);
@@ -101,6 +111,18 @@ export async function runPiSubagent(opts: {
 						if (part.type === "text") output += part.text;
 					}
 					if (event.message.model) model = event.message.model;
+
+					// Accumulate token usage across all assistant messages (multi-turn)
+					const u = event.message.usage;
+					if (u) {
+						usage.input += u.input || 0;
+						usage.output += u.output || 0;
+						usage.cacheRead += u.cacheRead || 0;
+						usage.cacheWrite += u.cacheWrite || 0;
+						if (u.cost) {
+							usage.cost += typeof u.cost === "number" ? u.cost : (u.cost.total || 0);
+						}
+					}
 				}
 			} catch { /* skip */ }
 		};
@@ -130,7 +152,8 @@ export async function runPiSubagent(opts: {
 		}
 	});
 
-	return { output, exitCode, model };
+	const durationMs = Date.now() - startTime;
+	return { output, exitCode, model, durationMs, usage };
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +170,40 @@ export async function writeTempPrompt(name: string, content: string): Promise<{ 
 export function cleanupTemp(dir: string, filePath: string) {
 	try { fs.unlinkSync(filePath); } catch {}
 	try { fs.rmdirSync(dir); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Token usage helpers
+// ---------------------------------------------------------------------------
+
+export function addUsage(target: TokenUsage, source: TokenUsage): void {
+	target.input += source.input;
+	target.output += source.output;
+	target.cacheRead += source.cacheRead;
+	target.cacheWrite += source.cacheWrite;
+	target.cost += source.cost;
+}
+
+export function formatTokens(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+	return `${n}`;
+}
+
+export function formatCost(cost: number): string {
+	if (cost === 0) return "$0.00";
+	if (cost < 0.01) return `$${cost.toFixed(4)}`;
+	return `$${cost.toFixed(2)}`;
+}
+
+export function formatDurationShort(ms: number): string {
+	const sec = Math.round(ms / 1000);
+	if (sec < 60) return `${sec}s`;
+	const min = Math.floor(sec / 60);
+	const rem = sec % 60;
+	if (min < 60) return `${min}m${rem}s`;
+	const hr = Math.floor(min / 60);
+	return `${hr}h${min % 60}m`;
 }
 
 // ---------------------------------------------------------------------------

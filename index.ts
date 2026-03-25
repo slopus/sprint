@@ -45,9 +45,14 @@ import {
 	buildReviewCritiquePrompt,
 	buildTaskSummaryPrompt,
 	extractVerdict,
+	addUsage,
+	formatTokens,
+	formatCost,
+	formatDurationShort,
 	DEBATE_TOOLS,
 	type SubagentResult,
 } from "./executor.js";
+import type { TokenUsage } from "./parser.js";
 import { writeSprintReport, syncRecordFromMarkdown } from "./report.js";
 import {
 	buildRoadmapProposalPrompt,
@@ -612,6 +617,22 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 	const tasks = record.tasks;
 	const title = record.title;
 
+	// Sprint-level usage tracking
+	const sprintStartTime = Date.now();
+	const sprintUsage: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	// Restore usage from already-completed tasks (for resume)
+	for (const t of tasks) {
+		if (t.usage) addUsage(sprintUsage, t.usage);
+	}
+
+	function updateSprintStatus(phase: string) {
+		const elapsed = formatDurationShort(Date.now() - sprintStartTime);
+		const totalTokens = sprintUsage.input + sprintUsage.output + sprintUsage.cacheRead;
+		const tokenStr = totalTokens > 0 ? ` ${formatTokens(totalTokens)}` : "";
+		const costStr = sprintUsage.cost > 0 ? ` ${formatCost(sprintUsage.cost)}` : "";
+		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `${phase} ⏱${elapsed}${tokenStr}${costStr}`));
+	}
+
 	ctx.ui.setWidget("sprint-progress", formatTaskWidget(tasks, ctx.ui.theme));
 	const doneAtStart = tasks.filter((t) => t.status === "done").length;
 	ctx.ui.setStatus("sprint", ctx.ui.theme.fg("accent", `🏃 ${title} [${doneAtStart}/${tasks.length}]`));
@@ -627,6 +648,9 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		task.status = "running";
 		task.startedAt = task.startedAt || Date.now();
 		record.currentTaskIndex = i;
+		// Reset task usage for fresh/retry execution
+		if (!task.usage) task.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+		const taskStartMs = Date.now();
 		addEvent(task, "started", `Assigned to ${task.isFrontend ? "frontend" : "backend"} profile`);
 		saveSprint(storagePath, record);
 		writeSprintReport(cwd, record);
@@ -634,7 +658,7 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 
 		const profile = profileForTask(task);
 		const tag = task.isFrontend ? "🎨 frontend" : "⚙️ backend";
-		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `▶ Task ${task.index}/${tasks.length}: ${task.title}`));
+		updateSprintStatus(`▶ Task ${task.index}/${tasks.length}: ${task.title}`);
 		pi.sendMessage({
 			customType: "sprint-exec-start",
 			content: `**Executing Task ${task.index}/${tasks.length}: ${task.title}**\n${tag} → ${profile.model} (thinking: ${profile.thinking})`,
@@ -649,29 +673,36 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 
 		task.executionOutput = execResult.output;
 		task.executionModel = execResult.model || profile.model;
-		addEvent(task, "executed", `exit=${execResult.exitCode} model=${task.executionModel} output_len=${execResult.output?.length || 0}`);
+		addUsage(task.usage, execResult.usage);
+		addUsage(sprintUsage, execResult.usage);
+		addEvent(task, "executed", `exit=${execResult.exitCode} model=${task.executionModel} tokens=${formatTokens(execResult.usage.input + execResult.usage.output)} cost=${formatCost(execResult.usage.cost)} time=${formatDurationShort(execResult.durationMs)}`);
 
+		const execTokens = execResult.usage.input + execResult.usage.output;
 		if (!execResult.output || execResult.exitCode !== 0) {
-			pi.sendMessage({ customType: "sprint-exec-fail", content: `**Task ${task.index} execution issue** (exit ${execResult.exitCode}):\n\n${execResult.output?.slice(0, 2000) || "(no output)"}`, display: true }, { triggerTurn: false });
+			pi.sendMessage({ customType: "sprint-exec-fail", content: `**Task ${task.index} execution issue** (exit ${execResult.exitCode}, ${formatDurationShort(execResult.durationMs)}, ${formatTokens(execTokens)} tokens):\n\n${execResult.output?.slice(0, 2000) || "(no output)"}`, display: true }, { triggerTurn: false });
 		} else {
-			pi.sendMessage({ customType: "sprint-exec-done", content: `**Task ${task.index} executed.** Output (excerpt):\n\n${execResult.output.slice(0, 3000)}`, display: true }, { triggerTurn: false });
+			pi.sendMessage({ customType: "sprint-exec-done", content: `**Task ${task.index} executed** (${formatDurationShort(execResult.durationMs)}, ${formatTokens(execTokens)} tokens, ${formatCost(execResult.usage.cost)})\n\nOutput (excerpt):\n\n${execResult.output.slice(0, 3000)}`, display: true }, { triggerTurn: false });
 		}
 
 		// --- Post-task review debate (first pass) ---
 		const primaryReviewer = task.isFrontend ? critic : proposer;
 		const secondaryReviewer = task.isFrontend ? proposer : critic;
 
-		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `🔎 Reviewing Task ${task.index}...`));
+		updateSprintStatus(`🔎 Reviewing Task ${task.index}...`);
 		pi.sendMessage({ customType: "sprint-review", content: `**Post-Task Review — Task ${task.index}** (primary: ${primaryReviewer.name}, secondary: ${secondaryReviewer.name})`, display: true }, { triggerTurn: false });
 
 		const reviewPrimary = await runDebateAgent(primaryReviewer, buildReviewProposalPrompt(task, execResult.output || "(empty)", false, null), cwd);
 		task.reviewProposal = reviewPrimary.output || null;
+		addUsage(task.usage, reviewPrimary.usage);
+		addUsage(sprintUsage, reviewPrimary.usage);
 		if (reviewPrimary.output) {
 			pi.sendMessage({ customType: "sprint-review-primary", content: `**Primary Review** (${primaryReviewer.name}):\n\n${reviewPrimary.output}`, display: true }, { triggerTurn: false });
 		}
 
 		const reviewSecondary = await runDebateAgent(secondaryReviewer, buildReviewCritiquePrompt(task, execResult.output || "(empty)", reviewPrimary.output || "(no review)", false, null), cwd);
 		task.reviewCritique = reviewSecondary.output || null;
+		addUsage(task.usage, reviewSecondary.usage);
+		addUsage(sprintUsage, reviewSecondary.usage);
 		if (reviewSecondary.output) {
 			pi.sendMessage({ customType: "sprint-review-secondary", content: `**Secondary Review** (${secondaryReviewer.name}):\n\n${reviewSecondary.output}`, display: true }, { triggerTurn: false });
 		}
@@ -683,11 +714,16 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 		addEvent(task, overallPass ? "review_pass" : "review_needs_work", `primary(${primaryReviewer.name})=${primaryVerdict} secondary(${secondaryReviewer.name})=${secondaryVerdict}`);
 
 		// --- LLM summary pass ---
-		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `📝 Summarizing Task ${task.index}...`));
+		updateSprintStatus(`📝 Summarizing Task ${task.index}...`);
 		const summaryResult = await runPiSubagent({
 			prompt: buildTaskSummaryPrompt(task), cwd, model: profile.model, tools: ["read", "grep", "find", "ls"],
 		});
 		task.summary = summaryResult.output || null;
+		addUsage(task.usage, summaryResult.usage);
+		addUsage(sprintUsage, summaryResult.usage);
+
+		// Finalize task timing
+		task.executionDurationMs = Date.now() - taskStartMs;
 
 		if (overallPass) {
 			task.status = "done";
@@ -696,8 +732,9 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 			writeSprintReport(cwd, record);
 			ctx.ui.setWidget("sprint-progress", formatTaskWidget(tasks, ctx.ui.theme));
 			const done = tasks.filter((t) => t.status === "done").length;
-			ctx.ui.setStatus("sprint", ctx.ui.theme.fg("accent", `🏃 ${title} [${done}/${tasks.length}]`));
-			pi.sendMessage({ customType: "sprint-task-pass", content: `**✅ Task ${task.index} PASSED** — ${task.title}`, display: true }, { triggerTurn: false });
+			const taskTokens = task.usage.input + task.usage.output + task.usage.cacheRead;
+			ctx.ui.setStatus("sprint", ctx.ui.theme.fg("accent", `🏃 ${title} [${done}/${tasks.length}] ${formatCost(sprintUsage.cost)}`));
+			pi.sendMessage({ customType: "sprint-task-pass", content: `**✅ Task ${task.index} PASSED** — ${task.title} (${formatDurationShort(task.executionDurationMs)}, ${formatTokens(taskTokens)} tokens, ${formatCost(task.usage.cost)})`, display: true }, { triggerTurn: false });
 			continue;
 		}
 
@@ -762,27 +799,33 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 
 		if (shouldRetry) {
 			// --- Retry with feedback context ---
-			ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `🔄 Retrying Task ${task.index}...`));
+			updateSprintStatus(`🔄 Retrying Task ${task.index}...`);
 			const retryResult = await runPiSubagent({
 				prompt: buildRetryPrompt(task, record.synthesis, priorFeedback),
 				cwd, model: profile.model, thinking: profile.thinking, tools: profile.tools,
 			});
 			task.executionOutput = retryResult.output;
-			addEvent(task, "executed", `retry exit=${retryResult.exitCode} output_len=${retryResult.output?.length || 0}`);
+			addUsage(task.usage, retryResult.usage);
+			addUsage(sprintUsage, retryResult.usage);
+			addEvent(task, "executed", `retry exit=${retryResult.exitCode} tokens=${formatTokens(retryResult.usage.input + retryResult.usage.output)} cost=${formatCost(retryResult.usage.cost)} time=${formatDurationShort(retryResult.durationMs)}`);
 
-			pi.sendMessage({ customType: "sprint-task-retry-done", content: `**Task ${task.index} retried.** Output:\n\n${retryResult.output?.slice(0, 2000) || "(no output)"}`, display: true }, { triggerTurn: false });
+			pi.sendMessage({ customType: "sprint-task-retry-done", content: `**Task ${task.index} retried** (${formatDurationShort(retryResult.durationMs)}, ${formatTokens(retryResult.usage.input + retryResult.usage.output)} tokens)\n\nOutput:\n\n${retryResult.output?.slice(0, 2000) || "(no output)"}`, display: true }, { triggerTurn: false });
 
 			// --- Post-retry review debate (with prior context) ---
-			ctx.ui.setStatus("sprint", ctx.ui.theme.fg("warning", `🔎 Re-reviewing Task ${task.index}...`));
+			updateSprintStatus(`🔎 Re-reviewing Task ${task.index}...`);
 
 			const retryReviewPrimary = await runDebateAgent(primaryReviewer, buildReviewProposalPrompt(task, retryResult.output || "(empty)", true, priorFeedback), cwd);
 			task.reviewProposal = retryReviewPrimary.output || null;
+			addUsage(task.usage, retryReviewPrimary.usage);
+			addUsage(sprintUsage, retryReviewPrimary.usage);
 			if (retryReviewPrimary.output) {
 				pi.sendMessage({ customType: "sprint-review-primary", content: `**Retry Review** (${primaryReviewer.name}):\n\n${retryReviewPrimary.output}`, display: true }, { triggerTurn: false });
 			}
 
 			const retryReviewSecondary = await runDebateAgent(secondaryReviewer, buildReviewCritiquePrompt(task, retryResult.output || "(empty)", retryReviewPrimary.output || "(no review)", true, priorFeedback), cwd);
 			task.reviewCritique = retryReviewSecondary.output || null;
+			addUsage(task.usage, retryReviewSecondary.usage);
+			addUsage(sprintUsage, retryReviewSecondary.usage);
 			if (retryReviewSecondary.output) {
 				pi.sendMessage({ customType: "sprint-review-secondary", content: `**Retry Secondary** (${secondaryReviewer.name}):\n\n${retryReviewSecondary.output}`, display: true }, { triggerTurn: false });
 			}
@@ -796,17 +839,22 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 				prompt: buildTaskSummaryPrompt(task), cwd, model: profile.model, tools: ["read", "grep", "find", "ls"],
 			});
 			task.summary = retrySummary.output || task.summary;
+			addUsage(task.usage, retrySummary.usage);
+			addUsage(sprintUsage, retrySummary.usage);
 
+			// Finalize task timing
+			task.executionDurationMs = Date.now() - taskStartMs;
 			task.status = "done";
 			task.completedAt = Date.now();
-			pi.sendMessage({ customType: "sprint-task-pass", content: `**✅ Task ${task.index} DONE** (retried) — ${task.title}`, display: true }, { triggerTurn: false });
+			const retryTaskTokens = task.usage.input + task.usage.output + task.usage.cacheRead;
+			pi.sendMessage({ customType: "sprint-task-pass", content: `**✅ Task ${task.index} DONE** (retried) — ${task.title} (${formatDurationShort(task.executionDurationMs)}, ${formatTokens(retryTaskTokens)} tokens, ${formatCost(task.usage.cost)})`, display: true }, { triggerTurn: false });
 		}
 
 		saveSprint(storagePath, record);
 		writeSprintReport(cwd, record);
 		ctx.ui.setWidget("sprint-progress", formatTaskWidget(tasks, ctx.ui.theme));
 		const done = tasks.filter((t) => t.status === "done").length;
-		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("accent", `🏃 ${title} [${done}/${tasks.length}]`));
+		ctx.ui.setStatus("sprint", ctx.ui.theme.fg("accent", `🏃 ${title} [${done}/${tasks.length}] ${formatCost(sprintUsage.cost)}`));
 	}
 
 	// =================================================================
@@ -819,12 +867,14 @@ async function executeSprintTasks(pi: ExtensionAPI, ctx: ExtensionCommandContext
 
 	const doneCount = tasks.filter((t) => t.status === "done").length;
 	const failedCount = tasks.filter((t) => t.status === "failed").length;
+	const totalSprintTokens = sprintUsage.input + sprintUsage.output + sprintUsage.cacheRead;
+	const sprintElapsed = formatDurationShort(Date.now() - sprintStartTime);
 	ctx.ui.setWidget("sprint-progress", undefined);
-	ctx.ui.setStatus("sprint", ctx.ui.theme.fg("success", `✓ ${title} — complete`));
+	ctx.ui.setStatus("sprint", ctx.ui.theme.fg("success", `✓ ${title} — complete (${sprintElapsed}, ${formatCost(sprintUsage.cost)})`));
 
 	pi.sendMessage({
 		customType: "sprint-complete",
-		content: `**🎉 Sprint Complete: ${title}**\n\n**Results:** ${doneCount} done, ${failedCount} skipped/failed out of ${tasks.length} tasks\n\n${tasks.map((t) => `${t.status === "done" ? "✅" : "❌"} Task ${t.index}: ${t.title}`).join("\n")}\n\n**Full report:** ${record.reportPath}`,
+		content: `**🎉 Sprint Complete: ${title}**\n\n**Results:** ${doneCount} done, ${failedCount} skipped/failed out of ${tasks.length} tasks\n**Time:** ${sprintElapsed} | **Tokens:** ${formatTokens(totalSprintTokens)} | **Cost:** ${formatCost(sprintUsage.cost)}\n\n${tasks.map((t) => {const tTok = (t.usage?.input || 0) + (t.usage?.output || 0) + (t.usage?.cacheRead || 0); return `${t.status === "done" ? "✅" : "❌"} Task ${t.index}: ${t.title} (${t.executionDurationMs > 0 ? formatDurationShort(t.executionDurationMs) : "—"}, ${tTok > 0 ? formatTokens(tTok) : "—"}, ${t.usage?.cost > 0 ? formatCost(t.usage.cost) : "—"})`;}).join("\n")}\n\n**Full report:** ${record.reportPath}`,
 		display: true,
 	}, { triggerTurn: false });
 }

@@ -13,7 +13,25 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { SprintRecord } from "./store.js";
-import type { SprintTask } from "./parser.js";
+import type { SprintTask, TokenUsage } from "./parser.js";
+import { formatTokens, formatCost, formatDurationShort } from "./executor.js";
+
+// ---------------------------------------------------------------------------
+// Usage aggregation
+// ---------------------------------------------------------------------------
+
+function aggregateUsage(tasks: SprintTask[]): TokenUsage {
+	const total: TokenUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	for (const t of tasks) {
+		if (!t.usage) continue;
+		total.input += t.usage.input || 0;
+		total.output += t.usage.output || 0;
+		total.cacheRead += t.usage.cacheRead || 0;
+		total.cacheWrite += t.usage.cacheWrite || 0;
+		total.cost += t.usage.cost || 0;
+	}
+	return total;
+}
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -67,6 +85,13 @@ export function generateSprintMarkdown(record: SprintRecord): string {
 	const failed = record.tasks.filter((t) => t.status === "failed").length;
 	const total = record.tasks.length;
 
+	// Aggregate usage across all tasks
+	const totalUsage = aggregateUsage(record.tasks);
+	const totalExecMs = record.tasks.reduce((sum, t) => sum + (t.executionDurationMs || 0), 0);
+	const firstStart = record.tasks.map((t) => t.startedAt).filter(Boolean).sort()[0] as number | undefined;
+	const lastEnd = record.tasks.map((t) => t.completedAt).filter(Boolean).sort().pop() as number | undefined;
+	const wallClockMs = firstStart && lastEnd ? lastEnd - firstStart : 0;
+
 	// Header
 	lines.push(`# Sprint: ${record.title}`);
 	lines.push("");
@@ -76,6 +101,15 @@ export function generateSprintMarkdown(record: SprintRecord): string {
 	lines.push(`| **Created** | ${formatTimestamp(record.createdAt)} |`);
 	lines.push(`| **Tasks** | ${done} done, ${failed} failed/skipped, ${total} total |`);
 	lines.push(`| **Scan** | ${record.snapshotSummary} |`);
+	if (totalExecMs > 0 || wallClockMs > 0) {
+		lines.push(`| **Wall Clock** | ${wallClockMs > 0 ? formatDurationShort(wallClockMs) : "—"} |`);
+		lines.push(`| **Execution Time** | ${totalExecMs > 0 ? formatDurationShort(totalExecMs) : "—"} |`);
+	}
+	if (totalUsage.input > 0 || totalUsage.output > 0) {
+		const totalTokens = totalUsage.input + totalUsage.output + totalUsage.cacheRead;
+		lines.push(`| **Tokens** | ${formatTokens(totalTokens)} total (${formatTokens(totalUsage.input)} in, ${formatTokens(totalUsage.output)} out, ${formatTokens(totalUsage.cacheRead)} cache) |`);
+		lines.push(`| **Cost** | ${formatCost(totalUsage.cost)} |`);
+	}
 	lines.push("");
 
 	// Table of contents
@@ -132,6 +166,8 @@ export function generateSprintMarkdown(record: SprintRecord): string {
 		const statusIcon = task.status === "done" ? "✅" : task.status === "failed" ? "❌" : task.status === "running" ? "▶" : "⏸";
 		const typeTag = task.isFrontend ? "🎨 Frontend" : "⚙️ Backend";
 
+		const taskTokens = (task.usage?.input || 0) + (task.usage?.output || 0) + (task.usage?.cacheRead || 0);
+
 		lines.push(`| Field | Value |`);
 		lines.push(`|-------|-------|`);
 		lines.push(`| **Status** | ${statusIcon} ${task.status} |`);
@@ -140,6 +176,13 @@ export function generateSprintMarkdown(record: SprintRecord): string {
 		lines.push(`| **Started** | ${formatTimestamp(task.startedAt)} |`);
 		lines.push(`| **Completed** | ${formatTimestamp(task.completedAt)} |`);
 		lines.push(`| **Duration** | ${formatDuration(task.startedAt, task.completedAt)} |`);
+		if (task.executionDurationMs > 0) {
+			lines.push(`| **Exec Time** | ${formatDurationShort(task.executionDurationMs)} |`);
+		}
+		if (taskTokens > 0) {
+			lines.push(`| **Tokens** | ${formatTokens(taskTokens)} (${formatTokens(task.usage.input)} in, ${formatTokens(task.usage.output)} out, ${formatTokens(task.usage.cacheRead)} cache) |`);
+			lines.push(`| **Cost** | ${formatCost(task.usage.cost)} |`);
+		}
 		lines.push(`| **Verdict** | ${task.reviewVerdict || "—"} |`);
 		lines.push("");
 
@@ -213,21 +256,22 @@ export function generateSprintMarkdown(record: SprintRecord): string {
 	lines.push("");
 	lines.push(`## Summary`);
 	lines.push("");
-	lines.push(`| Task | Status | Type | Duration | Verdict |`);
-	lines.push(`|------|--------|------|----------|---------|`);
+	lines.push(`| Task | Status | Type | Duration | Tokens | Cost | Verdict |`);
+	lines.push(`|------|--------|------|----------|--------|------|---------|`);
 	for (const task of record.tasks) {
 		const icon = task.status === "done" ? "✅" : task.status === "failed" ? "❌" : "⏸";
 		const type = task.isFrontend ? "frontend" : "backend";
-		const dur = formatDuration(task.startedAt, task.completedAt);
-		lines.push(`| ${task.index}. ${task.title} | ${icon} ${task.status} | ${type} | ${dur} | ${task.reviewVerdict || "—"} |`);
+		const dur = task.executionDurationMs > 0 ? formatDurationShort(task.executionDurationMs) : formatDuration(task.startedAt, task.completedAt);
+		const tTokens = (task.usage?.input || 0) + (task.usage?.output || 0) + (task.usage?.cacheRead || 0);
+		const tokens = tTokens > 0 ? formatTokens(tTokens) : "—";
+		const cost = task.usage?.cost > 0 ? formatCost(task.usage.cost) : "—";
+		lines.push(`| ${task.index}. ${task.title} | ${icon} ${task.status} | ${type} | ${dur} | ${tokens} | ${cost} | ${task.reviewVerdict || "—"} |`);
 	}
 	lines.push("");
 
-	// Sprint-level timing
-	const firstStart = record.tasks.map((t) => t.startedAt).filter(Boolean).sort()[0];
-	const lastEnd = record.tasks.map((t) => t.completedAt).filter(Boolean).sort().pop();
-	if (firstStart && lastEnd) {
-		lines.push(`**Total execution time:** ${formatDuration(firstStart, lastEnd)}`);
+	// Sprint-level totals
+	if (wallClockMs > 0) {
+		lines.push(`**Wall clock:** ${formatDurationShort(wallClockMs)} | **Execution time:** ${formatDurationShort(totalExecMs)} | **Total tokens:** ${formatTokens(totalUsage.input + totalUsage.output + totalUsage.cacheRead)} | **Total cost:** ${formatCost(totalUsage.cost)}`);
 		lines.push("");
 	}
 
